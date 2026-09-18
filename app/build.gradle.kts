@@ -24,7 +24,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.example.daysurpopt"
+        applicationId = "com.jagones84.financialawareness"
         minSdk = 24
         targetSdk = 35
         versionCode = 2
