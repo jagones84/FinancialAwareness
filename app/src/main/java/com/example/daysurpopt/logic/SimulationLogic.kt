@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 jagones84
+
 package com.example.daysurpopt.logic
 
 import com.example.daysurpopt.domain.*
@@ -74,7 +77,22 @@ fun calculateStandardDeviation(numbers: List<Double>): Double {
     return sqrt(variance)
 }
 
+fun computeMaxUtilityMonthlySpend(inputs: FinancialInput): Double {
+    val curve = inputs.utilityCurvePoints
+        ?.filter { it.x.isFinite() && it.y.isFinite() }
+        ?.takeIf { it.size >= 2 }
+    if (curve != null) {
+        val curveMax = curve.maxOf { it.y }
+        val xSat = curve.filter { it.y >= curveMax }.minOf { it.x }
+        return xSat * DAYS_PER_MONTH
+    }
+    return inputs.valoreSpesaGiornalieraMaxUtilita * DAYS_PER_MONTH
+}
+
 private const val STD_EPSILON = 1e-12
+private const val DEATH_LEGACY_PENALTY = 2.5
+private const val LEGACY_BREACH_FLOOR = 1.0
+private const val UTILITY_SENTINEL_ABS = 1e6
 private const val DAYS_PER_MONTH = 365.25 / 12.0
 
 fun computeStabilityScore(avgUtilita: Double, stdDevUtilita: Double): Double {
@@ -262,6 +280,7 @@ fun calculateSimulation(
         val p4Month = max(0, (p4Age - inputs.etaAttuale) * 12)
         val capitalMonthlyRate = monthlyRateFromAnnual(inputs.tassoGuadagnoInteresse)
         val debtMonthlyRate = monthlyRateFromAnnual(inputs.tassoInteresseDebito)
+        val maxUtilSpendMonthly = computeMaxUtilityMonthlySpend(inputs)
 
         val expenseAmountByMonth = DoubleArray(monthCount)
         val expenseUtilityOffsetByMonth = DoubleArray(monthCount)
@@ -272,28 +291,16 @@ fun calculateSimulation(
                 expenseUtilityOffsetByMonth[month] += expense.utilityOffset
             }
         }
+        val minimumSpendByMonth = DoubleArray(monthCount)
+        var offsetAccumulator = 0.0
+        for (month in 0 until monthCount) {
+            offsetAccumulator += expenseUtilityOffsetByMonth[month]
+            minimumSpendByMonth[month] = spesaMinimaPerEta(startAge + month / 12.0, offsetAccumulator, inputs)
+        }
+        val pensionMonth = max(0, ((inputs.etaPensione - startAge) * 12).roundToInt())
 
         val inheritanceMonth = ((inputs.etaRicevimentoEredita - startAge) * 12.0).roundToInt()
         val tfrMonth = ((inputs.etaPensione - startAge) * 12.0).roundToInt()
-
-        val discountBase = 1.0 + capitalMonthlyRate
-        val futureExpenseReserve = DoubleArray(monthCount)
-        if (monthCount >= 2) {
-            for (month in monthCount - 2 downTo 0) {
-                futureExpenseReserve[month] =
-                    (futureExpenseReserve[month + 1] + expenseAmountByMonth[month + 1]) / discountBase
-            }
-        }
-
-        fun reserveAt(month: Int): Double {
-            val periodsToHorizon = (monthCount - 1 - month).toDouble()
-            val bequestReserve = if (discountBase > 0.0) {
-                inputs.soldiDaConservare / discountBase.pow(periodsToHorizon)
-            } else {
-                inputs.soldiDaConservare
-            }
-            return bequestReserve + futureExpenseReserve[month]
-        }
 
         var capital = inputs.capitaleIniziale
         var debt = 0.0
@@ -312,6 +319,30 @@ fun calculateSimulation(
                 debt -= repaid
             }
             return repaid
+        }
+
+        fun forecastFinalWithMinimumSpend(fromMonth: Int, startCapital: Double, startDebt: Double): Double {
+            var forecastCapital = startCapital
+            var forecastDebt = startDebt
+            for (m in fromMonth until monthCount) {
+                val ageM = startAge + m / 12.0
+                forecastCapital *= (1.0 + capitalMonthlyRate)
+                if (forecastDebt > 0.0) forecastDebt *= (1.0 + debtMonthlyRate)
+                if (m == inheritanceMonth) forecastCapital += inputs.eredita
+                if (m == tfrMonth) forecastCapital += inputs.tfrNetto
+                forecastCapital -= expenseAmountByMonth[m]
+                forecastCapital += monthlySurplusForAge(ageM, inputs, surplusData, surplusOffset) -
+                    minimumSpendByMonth[m]
+                if (forecastCapital < 0.0) {
+                    forecastDebt += -forecastCapital
+                    forecastCapital = 0.0
+                } else if (forecastCapital > 0.0 && forecastDebt > 0.0) {
+                    val repaid = min(forecastCapital, forecastDebt)
+                    forecastCapital -= repaid
+                    forecastDebt -= repaid
+                }
+            }
+            return forecastCapital - forecastDebt
         }
 
         for (month in 0 until monthCount) {
@@ -339,14 +370,35 @@ fun calculateSimulation(
             capital += monthlySaving
             debtRepayment += normalizeBalances()
 
-            val reserve = reserveAt(month)
             val availableNetWorth = (capital - debt).coerceAtLeast(0.0)
-            val excess = (availableNetWorth - reserve).coerceAtLeast(0.0)
             val remainingMonths = (monthCount - month).coerceAtLeast(1)
-            val draw = if (month >= p4Month) {
-                min(excess, inputs.p3PercentualeCapitaleDaSpendereAnnualmente * excess / remainingMonths.toDouble())
-            } else {
-                0.0
+            val draw = when {
+                month < p4Month -> 0.0
+                month < pensionMonth -> {
+                    val spendable = (availableNetWorth - inputs.soldiDaConservare).coerceAtLeast(0.0)
+                    inputs.p3PercentualeCapitaleDaSpendereAnnualmente * spendable / remainingMonths.toDouble()
+                }
+                else -> {
+                    val yearsLeft = remainingMonths / 12.0
+                    val i = inputs.tassoGuadagnoInteresse
+                    val annuityAnnual = if (i > 0.0) {
+                        ((availableNetWorth * (1.0 + i).pow(yearsLeft) - inputs.soldiDaConservare) * i) /
+                            ((1.0 + i).pow(yearsLeft) - 1.0)
+                    } else {
+                        (availableNetWorth - inputs.soldiDaConservare) / yearsLeft
+                    }
+                    val annuityMonthly = inputs.p3PercentualeCapitaleDaSpendereAnnualmente *
+                        (annuityAnnual - debt * inputs.tassoInteresseDebito) / 12.0
+                    val postDrawCapital = (capital - annuityMonthly).coerceAtLeast(0.0)
+                    val postDrawForecast = forecastFinalWithMinimumSpend(month + 1, postDrawCapital, debt)
+                    if (annuityMonthly <= 0.0 ||
+                        postDrawForecast < inputs.soldiDaConservare + 1.0
+                    ) {
+                        0.0
+                    } else {
+                        annuityMonthly
+                    }
+                }
             }
 
             if (draw > 0.0) {
@@ -355,8 +407,8 @@ fun calculateSimulation(
             }
 
             val baseSpend = (spendSurplus + draw).coerceAtLeast(0.0)
-            val minimumSpend = spesaMinimaPerEta(age, cumulativeUtilityOffset, inputs)
-            val finalSpend = max(baseSpend, minimumSpend)
+            val minimumSpend = minimumSpendByMonth[month]
+            val finalSpend = max(min(baseSpend, maxUtilSpendMonthly), minimumSpend)
             val additionalSpendNeeded = (finalSpend - baseSpend).coerceAtLeast(0.0)
 
             if (additionalSpendNeeded > 0.0) {
@@ -364,7 +416,7 @@ fun calculateSimulation(
                 normalizeBalances()
             }
 
-            val utility = utilitaDaSpesa(age, finalSpend, inputs) + cumulativeUtilityOffset
+            val utility = (utilitaDaSpesa(age, finalSpend, inputs) + cumulativeUtilityOffset).coerceAtMost(1.0)
             val savingRatioEffettivo = if (monthlySurplus > 0.0) (monthlySaving / monthlySurplus) else 0.0
             val violazioneLascito = month == monthCount - 1 && (capital - debt) < (inputs.soldiDaConservare - 1.0)
 
@@ -418,37 +470,40 @@ fun calculateObjectivesFromYears(
     val isFeasible = !years.any { it.violazioneLascito } &&
         utilitySamples.none { !it.isFinite() || it < 0.0 }
 
-    // NEW LOGIC: Any constraint violation or math error forces objective to 0.0.
-    if (years.any { it.violazioneLascito }) {
-        AppDebugLog.add("SimLogic", "Zero objective: violazioneLascito detected in ${years.count { it.violazioneLascito }} years")
-        return ObjectiveResults(0.0, 0.0, 0.0, 0.0, 0.0, false, finalCapital, legacyGap)
-    }
-    if (utilitySamples.any { !it.isFinite() }) {
-        AppDebugLog.add("SimLogic", "Zero objective: Non-finite utility detected")
-        return ObjectiveResults(0.0, 0.0, 0.0, 0.0, 0.0, false, finalCapital, legacyGap)
-    }
-    if (utilitySamples.any { it < 0.0 }) {
-        AppDebugLog.add("SimLogic", "Zero objective: Negative utility detected")
+    // Math-error guard only: non-finite samples or the -1e9 exception dummy force 0.
+    // Finite negative samples (disutility offsets) flow into the average - graded, old-style.
+    if (utilitySamples.any { !it.isFinite() || abs(it) >= UTILITY_SENTINEL_ABS }) {
+        AppDebugLog.add("SimLogic", "Zero objective: non-finite or sentinel utility sample detected")
         return ObjectiveResults(0.0, 0.0, 0.0, 0.0, 0.0, false, finalCapital, legacyGap)
     }
 
     val avgUtilita = utilitySamples.average()
-    
-    if (!avgUtilita.isFinite() || avgUtilita <= 0.0) {
-        AppDebugLog.add("SimLogic", "Zero objective: avgUtilita <= 0 or infinite: $avgUtilita")
+    if (!avgUtilita.isFinite()) {
+        AppDebugLog.add("SimLogic", "Zero objective: non-finite avgUtilita: $avgUtilita")
         return ObjectiveResults(0.0, 0.0, 0.0, 0.0, 0.0, false, finalCapital, legacyGap)
     }
 
     val stdDevUtilita = calculateStandardDeviation(utilitySamples)
-    val fObjW = computeObjective(avgUtilita, stdDevUtilita, bonusStdWeight)
-    
-    // Log meaningful results
-    if (fObjW < 0.0001) {
+    val legacyViolated = years.any { it.violazioneLascito }
+    val finalNetWorth = finalCapital - (years.lastOrNull()?.debtAmount ?: 0.0)
+    val legacyPenalty = if (legacyViolated && legacyTarget != null && legacyTarget > 0.0) {
+        val shortfallRatio = ((legacyTarget - finalNetWorth) / legacyTarget).coerceAtLeast(0.0)
+        LEGACY_BREACH_FLOOR + DEATH_LEGACY_PENALTY * shortfallRatio
+    } else if (legacyViolated) {
+        DEATH_LEGACY_PENALTY
+    } else {
+        0.0
+    }
+
+    val fObjW = computeObjective(avgUtilita, stdDevUtilita, bonusStdWeight) - legacyPenalty
+    if (legacyViolated) {
+        AppDebugLog.add("SimLogic", "Graded legacy penalty: fObjW=$fObjW (penalty=$legacyPenalty, net=$finalNetWorth, target=$legacyTarget)")
+    }
+    if (!legacyViolated && fObjW < 0.0001) {
         AppDebugLog.add("SimLogic", "Low fObjW: $fObjW (avg: $avgUtilita, std: $stdDevUtilita)")
     }
 
-    val fObj0 = computeObjective(avgUtilita, stdDevUtilita, 0.0)
-    
+    val fObj0 = computeObjective(avgUtilita, stdDevUtilita, 0.0) - legacyPenalty
     val stabilityIndex = computeStabilityScore(avgUtilita, stdDevUtilita)
 
     return ObjectiveResults(

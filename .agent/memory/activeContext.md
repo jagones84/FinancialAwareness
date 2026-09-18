@@ -145,9 +145,81 @@ All audit fixes from HANDOFF.md applied step-by-step with TDD (red-first), sessi
     docs/, tools/, .agent/, HANDOFF.md, gradle). git status verified: only tracked-modified +
     ?? .agent/; check-ignore confirms build/.gradle/.idea/.kotlin/local.properties.
 
+25. **Fobj > 1 regression fixed (user report, systematic-debugging)**: NOT the stability formula
+    (Avg/(Avg+Std) clamped [0,1] since commit 2d49502) but `utilitaDaSpesa + cumulativeUtilityOffset`
+    at SimulationLogic.kt:367 — offset added AFTER the [0,1] clamp; positive offsets (UI-editable
+    per expense) push samples > 1 → avg > 1 → fObjW > 1 in the fobj heatmap. Reproduced red-first
+    (max sample 1.1585, offset 0.9) → fix `.coerceAtMost(1.0)` top-only (negative samples keep
+    infeasible→0 semantics; solver graze unaffected). Test
+    `utilityWithOffset_stays_bounded_and_fobj_never_exceeds_one`; suite 138/0/1 skip.
+    NOTE: stored prefs (2026-09-01) have all 50 offsets = 0 — symptom requires offsets > 0.
+
+26. **Graded cost function + spend cap (user request, brainstorm→spec→plan→TDD)**: fobj landscape
+    was flat-with-cliffs — floor pinned defensive plans to the same score, 2d49502's binary zero-out
+    made every violation a flat 0, no spend cap wasted capital. Fix (spec
+    `docs/superpowers/specs/2026-09-02-graded-cost-function-design.md`, plan
+    `docs/superpowers/plans/2026-09-02-graded-cost-function.md`): (1) graded penalty
+    `100/planYears` subtracted from fObjW AND fObj0 on legacy violation (violators always negative,
+    smooth slope); finite negative samples flow into avg; only math-error sentinel still zeroes.
+    (2) `computeMaxUtilityMonthlySpend` (curve max-y plateau x; default = daily-max × DAYS_PER_MONTH)
+    caps voluntary spend, floor unconditional → solver semantics exact, C* can only decrease.
+    Suite 147/0/1 skip, assembleDebug green. fdeg uses CONTINUOUS age (within-year utility drifts
+    ~0.002) — plateau assertions must not assume constant samples.
+
+27. **REVISION 2 — spend rule + proportional penalty (user: "sempre quadrata, quadratone piatto")**:
+    real-data landscape diagnostic proved the feasible plateau was FLOOR-PINNING (reserve-gated
+    draw dead: P1>=0.4 byte-identical, spread 0.017). Restored the old three-branch spend rule:
+    pre-pension p3 quota on (netWorth - legacy); retirement = p3-SCALED PMT annuity gated on p3>0
+    (goal-solver contract p3=0 -> no draw — ungated version broke 19 tests); forecast brake
+    (forecastFinalWithMinimumSpend < legacy+1 -> draw 0). Penalty now SHORTFALL-PROPORTIONAL:
+    2.5 x (legacy - finalNetWorth)/legacy (marginal breaches ~-0.04, full breach -2.5; scale bug
+    100-vs-2.5 caught by the diagnostic). RESULT: spread 1.61, P2 gradient 0.147->0.189,
+    P1=0 -> -1.42. Suite 149/0/1 skip, assembleDebug green. cross_model_regression.py STALE.
+
+28. **REVISION 2b — separation + post-draw brake (user caught the optimizer bug)**: with pure
+    proportional penalty, marginal breachers outscored feasible plans -> the GA picked
+    legacy-violating plans. Fix: penalty = 1.0 (floor) + 2.5 x shortfallRatio -> every violator
+    < 0 <= every feasible plan (test `legacyViolation_penalty_guarantees_separation_from_feasible_plans`);
+    forecast brake now POST-DRAW (forecast from month+1 at capital-annuity, June semantics) ->
+    the real-data marginal breach vanished (finalCapital 50,006, viol 0, current plan 0.1922;
+    P1=0 -> -2.39; P1>=0.2 band feasible with P2 gradient 0.188->0.196). Suite 150/0/1 skip,
+    assembleDebug green.
+
+29. **REVISION 3 — June-vs-current A/B + heatmap color anchoring (user: "sempre piatta, anche
+    w=0")**: June engine (dc1e7a0) ported verbatim into `JuneEngineLandscapeABTest` and A/B'd on
+    the real P1xP2 grid at w in {user, 0, 1}: June is EQUALLY floor-pinned on today's data
+    (feasible avg spread ~0.013 vs current 0.042, cap%=0, avg ~= T) -> the engine matches June;
+    flatness is data-inherent (141k expenses + 50k legacy vs 100k capital). The VISUAL flatness
+    was the color scale: raw fObjW min/max stretched over the penalty range (-2.39) compressed
+    the feasible band (0.204..0.246) to ~1.6% -> one color. Fix display-only:
+    `SurfaceGrid.anchorColorScaleOnFeasible` + `getFeasibleAnchoredRange` (2D zmin/zmax anchored
+    on cells >= 0, violators clamp dark; 3D + delta grids raw). New `PlotlySpecBuilderColorScaleTest`
+    (6 contract tests). Suite 157/0/1 skip, assembleDebug green.
+
+30. **DATA AUDIT + engine exoneration (user: "i dati sono sensati? c'e' qualche errore?")**: new
+    opt-in `user_real_data_sensibleness_audit` + synthetic `richSurplusData_produces_nonFlat_p1Landscape`.
+    Data SENSIBLE (surplus 1,258/mo work vs 853/mo minimum at T=0.2; 141.5k expenses; 169k@57
+    inheritance; 100k TFR). Plateau P1>0.322 is FLOOR PHYSICS (1-853/1258=0.322, measured 0.325);
+    chasm at the boundary is the separation floor (graded below: -0.83/-1.33/-1.84); engine PROVEN
+    rich on synthetic data (spread 0.252, smooth); heatmap code unchanged since June (2 commits
+    2026-06-26). Suite 159/0/1 skip, assembleDebug green.
+
+31. **THE ARCANUM (found by the USER): the flat landscape was the THRESHOLD T.** June used
+    sogliaMinimaFunzioneUtilita=0.1, now 0.2. T sets minSpend -> floor-bite boundary
+    P1* = 1 - minSpend(T)/surplus. ARCANUM CHECK on real data: T=0.2 -> 30/36 feasible,
+    spread 0.0236 (yellow plateau) + 6 chasm cells; T=0.1 -> 36/36 feasible (no chasm),
+    spread 0.1229 (5.2x) = June landscape back. NO code change needed; engine was exonerated.
+    At T=0.1/w=1 the heatmap is smooth single-peaked (~0.19 @ P1~0.15/P2~52; current 0.16).
+    Manual: README-goal-solver rule 7, HANDOFF 0g ARCANUM.
+
+32. **LICENSE change: MIT → AGPL-3.0-or-later** (user request: block copy-and-resell on
+    Play Store). LICENSE = official gnu.org text (34,523 bytes, verified); SPDX+copyright
+    header added to all 100 .kt files under app/src (BOM/EOL preserved, verified 100/100);
+    README License section added; HANDOFF 0h. Post-change: full suite + build green.
+
 ## Verification
 
-- testDebugUnitTest: 137 tests / 0 failures / 0 errors (1 opt-in skip).
+- testDebugUnitTest: 159 tests / 0 failures / 0 errors (1 opt-in skip).
 
 - assembleDebug: green.
 

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 jagones84
+
 package com.example.daysurpopt.logic
 
 import com.example.daysurpopt.domain.FinancialInput
@@ -254,6 +257,268 @@ class SimulationLogicTest {
     }
 
     @Test
+    fun utilityWithOffset_stays_bounded_and_fobj_never_exceeds_one() {
+        val baseInput = FinancialInput(
+            p1SavingRatioSurplus = 0.0,
+            p2EtaFineRisparmioNoCapitale = 61,
+            p3PercentualeCapitaleDaSpendereAnnualmente = 0.9171,
+            p4EtaAnticipataInizioSpesaCapitale = 82,
+            etaAttuale = 30,
+            etaPensione = 67,
+            etaMorte = 90,
+            soldiDaConservare = 50000.0,
+            capitaleIniziale = 10000.0,
+            valoreSpesaGiornalieraMaxUtilita = 150.0,
+            sogliaMinimaFunzioneUtilita = 0.1
+        ).withDefaultAssumptionCurves()
+
+        val surplusInput = SurplusInput(
+            mutuoAffitto = 500.0,
+            mutuoAffittoFinoEta = 60
+        )
+        val expenses = listOf(SpecificExpense(age = 31, amount = 1000.0, utilityOffset = 0.9))
+
+        val years = calculateSimulation(baseInput, expenses, surplusInput)
+        val samples = years.flatMap { it.monthlyUtilitySamples }
+
+        assertTrue(samples.isNotEmpty())
+        val maxSample = samples.max()
+        assertTrue(
+            "Utility samples must stay within [0,1] after offset, got max=$maxSample",
+            maxSample <= 1.0 + 1e-9
+        )
+
+        val objectives = calculateObjectivesFromYears(
+            years = years,
+            bonusStdWeight = 1.0,
+            legacyTarget = baseInput.soldiDaConservare
+        )
+        assertTrue(
+            "fObjW must stay within [0,1] after offset, got ${objectives.fObjW}",
+            objectives.fObjW <= 1.0 + 1e-9
+        )
+    }
+
+    @Test
+    fun legacyViolation_gets_graded_penalty_instead_of_zero() {
+        val violatingYears = listOf(
+            SimulationYear(
+                eta = 40, funzioneUtilita = 0.5, capitaleFineAnno = 1000.0,
+                monthlyUtilitySamples = List(12) { 0.5 }
+            ),
+            SimulationYear(
+                eta = 41, funzioneUtilita = 0.5, capitaleFineAnno = 0.0,
+                monthlyUtilitySamples = List(12) { 0.5 }, violazioneLascito = true
+            )
+        )
+        val violating = calculateObjectivesFromYears(violatingYears, bonusStdWeight = 1.0, legacyTarget = 500.0)
+        // floor + proportional: 1.0 + 2.5 * (500 - 0) / 500 = 3.5 (full breach)
+        assertEquals(0.5 - 3.5, violating.fObjW, 1e-9)
+        assertEquals(0.5 - 3.5, violating.fObj0, 1e-9)
+        assertFalse(violating.isFeasible)
+
+        val feasibleYears = violatingYears.map { it.copy(violazioneLascito = false) }
+        val feasible = calculateObjectivesFromYears(feasibleYears, bonusStdWeight = 1.0, legacyTarget = 500.0)
+        assertEquals(0.5, feasible.fObjW, 1e-9)
+        assertTrue(violating.fObjW < feasible.fObjW)
+    }
+
+    @Test
+    fun legacyViolation_penalty_preserves_gradient_between_plans() {
+        fun yearsWith(sample: Double): List<SimulationYear> = listOf(
+            SimulationYear(
+                eta = 40, funzioneUtilita = sample, capitaleFineAnno = 0.0,
+                monthlyUtilitySamples = List(12) { sample }, violazioneLascito = true
+            )
+        )
+        val low = calculateObjectivesFromYears(yearsWith(0.3), bonusStdWeight = 1.0, legacyTarget = 0.0)
+        val high = calculateObjectivesFromYears(yearsWith(0.6), bonusStdWeight = 1.0, legacyTarget = 0.0)
+        assertEquals(0.3 - 2.5, low.fObjW, 1e-9)
+        assertEquals(0.6 - 2.5, high.fObjW, 1e-9)
+        assertTrue(high.fObjW > low.fObjW)
+        assertTrue(low.fObjW < 0.0 && high.fObjW < 0.0)
+    }
+
+    @Test
+    fun negativeFiniteSamples_flowIntoGradedAverage() {
+        val years = listOf(
+            SimulationYear(
+                eta = 40, funzioneUtilita = 0.2, capitaleFineAnno = 0.0,
+                monthlyUtilitySamples = listOf(0.4, -0.2)
+            )
+        )
+        val result = calculateObjectivesFromYears(years, bonusStdWeight = 0.0, legacyTarget = 0.0)
+        assertEquals(0.1, result.avgUtilita, 1e-9)
+        assertEquals(0.1, result.fObjW, 1e-9)
+        assertFalse(result.isFeasible)
+    }
+
+    @Test
+    fun exceptionSentinel_stillForcesZeroObjective() {
+        val years = listOf(
+            SimulationYear(
+                eta = 40, funzioneUtilita = -1e9, capitaleFineAnno = 0.0,
+                monthlyUtilitySamples = listOf(-1e9)
+            )
+        )
+        val result = calculateObjectivesFromYears(years, bonusStdWeight = 1.0, legacyTarget = 0.0)
+        assertEquals(0.0, result.fObjW, 0.0)
+        assertEquals(0.0, result.fObj0, 0.0)
+    }
+
+    @Test
+    fun legacyViolation_penalty_guarantees_separation_from_feasible_plans() {
+        // A marginal breacher with a HIGH utility base must still score below ANY feasible plan,
+        // otherwise the maximizer prefers violating the legacy (user-reported optimizer bug).
+        val breacher = calculateObjectivesFromYears(
+            listOf(
+                SimulationYear(
+                    eta = 40, funzioneUtilita = 0.9, capitaleFineAnno = 49_999.0,
+                    monthlyUtilitySamples = List(12) { 0.9 }, violazioneLascito = true
+                )
+            ),
+            bonusStdWeight = 1.0,
+            legacyTarget = 50_000.0
+        )
+        assertEquals(
+            0.9 - 1.0 - 2.5 * 1.0 / 50_000.0,
+            breacher.fObjW,
+            1e-9
+        )
+        assertTrue("marginal breacher must score below zero", breacher.fObjW < 0.0)
+
+        val lowUtilityFeasible = calculateObjectivesFromYears(
+            listOf(
+                SimulationYear(
+                    eta = 40, funzioneUtilita = 0.05, capitaleFineAnno = 60_000.0,
+                    monthlyUtilitySamples = List(12) { 0.05 }
+                )
+            ),
+            bonusStdWeight = 1.0,
+            legacyTarget = 50_000.0
+        )
+        assertEquals(0.05, lowUtilityFeasible.fObjW, 1e-9)
+        assertTrue(
+            "feasible plan (even with low utility) must beat any legacy violator",
+            lowUtilityFeasible.fObjW > breacher.fObjW
+        )
+    }
+
+    @Test
+    fun p3Draw_isAnnuitizedOnNetWorthMinusLegacy_notReserveGated() {
+        val zeroSurplus = SurplusInput(
+            stipendioMensile = 0.0, premioRisultatoNettoAnnuale = 0.0, tredicesimaQuattordicesimaNetto = 0.0,
+            pensioneMensileNetta = 0.0, mutuoAffitto = 0.0,
+            condominioLavorativa = 0.0, bolletteLavorativa = 0.0, ciboLavorativa = 0.0, veicoliLavorativa = 0.0,
+            palestraLavorativa = 0.0, trasportiViaggiLavorativa = 0.0, saluteLavorativa = 0.0,
+            vacanzeLavorativa = 0.0, shoppingLavorativa = 0.0, altroLavorativa = 0.0,
+            condominioPensione = 0.0, bollettePensione = 0.0, ciboPensione = 0.0, veicoliPensione = 0.0,
+            palestraPensione = 0.0, trasportiViaggiPensione = 0.0, salutePensione = 0.0,
+            vacanzePensione = 0.0, shoppingPensione = 0.0, altroPensione = 0.0
+        )
+        val inputs = FinancialInput(
+            p1SavingRatioSurplus = 0.0,
+            p2EtaFineRisparmioNoCapitale = 45,
+            p3PercentualeCapitaleDaSpendereAnnualmente = 1.0,
+            p4EtaAnticipataInizioSpesaCapitale = 45,
+            etaAttuale = 45,
+            etaPensione = 67,
+            etaMorte = 85,
+            soldiDaConservare = 10000.0,
+            capitaleIniziale = 400_000.0,
+            valoreSpesaGiornalieraMaxUtilita = 100.0,
+            sogliaMinimaFunzioneUtilita = 0.1
+        ).withDefaultAssumptionCurves()
+        val bigLateExpense = listOf(SpecificExpense(age = 84, amount = 350_000.0))
+
+        val spendWith = calculateSimulation(inputs, bigLateExpense, zeroSurplus)
+            .first().spesaMensileCorrettaFinale
+        val spendWithout = calculateSimulation(inputs, emptyList(), zeroSurplus)
+            .first().spesaMensileCorrettaFinale
+
+        assertEquals(spendWithout, spendWith, 10.0)
+        assertTrue("annuitized draw must be active: $spendWith EUR/month", spendWith > 700.0)
+    }
+
+    @Test
+    fun computeMaxUtilityMonthlySpend_defaultSigmoid_usesDailyMax() {
+        val inputs = FinancialInput(valoreSpesaGiornalieraMaxUtilita = 150.0)
+        assertEquals(150.0 * (365.25 / 12.0), computeMaxUtilityMonthlySpend(inputs), 1e-9)
+    }
+
+    @Test
+    fun computeMaxUtilityMonthlySpend_curveCapsAtPlateauStart() {
+        val inputs = FinancialInput(
+            valoreSpesaGiornalieraMaxUtilita = 150.0,
+            utilityCurvePoints = listOf(
+                CurvePoint(x = 0.0, y = 0.2),
+                CurvePoint(x = 100.0, y = 0.9),
+                CurvePoint(x = 200.0, y = 0.9)
+            )
+        )
+        assertEquals(100.0 * (365.25 / 12.0), computeMaxUtilityMonthlySpend(inputs), 1e-9)
+    }
+
+    @Test
+    fun computeMaxUtilityMonthlySpend_singlePointCurve_fallsBackToDailyMax() {
+        val inputs = FinancialInput(
+            valoreSpesaGiornalieraMaxUtilita = 150.0,
+            utilityCurvePoints = listOf(CurvePoint(x = 10.0, y = 0.9))
+        )
+        assertEquals(150.0 * (365.25 / 12.0), computeMaxUtilityMonthlySpend(inputs), 1e-9)
+    }
+
+    @Test
+    fun spendCap_limitsVoluntarySpending_toMaxUtilitySpend() {
+        val inputs = FinancialInput(
+            p1SavingRatioSurplus = 0.0,
+            p2EtaFineRisparmioNoCapitale = 30,
+            p3PercentualeCapitaleDaSpendereAnnualmente = 1.0,
+            p4EtaAnticipataInizioSpesaCapitale = 30,
+            etaAttuale = 30,
+            etaPensione = 67,
+            etaMorte = 90,
+            soldiDaConservare = 50000.0,
+            capitaleIniziale = 10_000_000.0,
+            valoreSpesaGiornalieraMaxUtilita = 10.0,
+            sogliaMinimaFunzioneUtilita = 0.1
+        )
+        val years = calculateSimulation(inputs, emptyList(), SurplusInput())
+        val cap = computeMaxUtilityMonthlySpend(inputs)
+        assertTrue(years.isNotEmpty())
+        assertEquals(cap, years.first().spesaMensileCorrettaFinale, 1e-6)
+        val samples = years.first().monthlyUtilitySamples
+        assertTrue(samples.isNotEmpty())
+        assertTrue(
+            "utility must sit on the saturation plateau (only fdeg drifts within the year): spread=${samples.max() - samples.min()}",
+            samples.max() - samples.min() < 0.01
+        )
+    }
+
+    @Test
+    fun spendCap_floorWins_whenMinimumSpendExceedsCap() {
+        val inputs = FinancialInput(
+            p1SavingRatioSurplus = 0.0,
+            p2EtaFineRisparmioNoCapitale = 30,
+            p3PercentualeCapitaleDaSpendereAnnualmente = 1.0,
+            p4EtaAnticipataInizioSpesaCapitale = 30,
+            etaAttuale = 30,
+            etaPensione = 67,
+            etaMorte = 90,
+            soldiDaConservare = 50000.0,
+            capitaleIniziale = 10_000_000.0,
+            valoreSpesaGiornalieraMaxUtilita = 10.0,
+            sogliaMinimaFunzioneUtilita = 0.95
+        )
+        val years = calculateSimulation(inputs, emptyList(), SurplusInput())
+        val cap = computeMaxUtilityMonthlySpend(inputs)
+        assertTrue(years.isNotEmpty())
+        assertTrue(years.first().spesaMensileCorrettaFinale > cap)
+        val samples = years.first().monthlyUtilitySamples
+        assertTrue(samples.min() >= 0.95 - 1e-6)
+    }
+
+    @Test
     fun calculateObjectivesFromYears_uses_bounded_stability_score() {
         val years = List(12) {
             SimulationYear(
@@ -419,7 +684,56 @@ class SimulationLogicTest {
         )
 
         val pythonReference = calculateSimulationWithWeight(inputs, expenses, surplus).first
-        assertEquals(0.1879212626130284, pythonReference, 1e-9)
+        // Locked 2026-07-30 (reserve-gated p3 draw) at 0.1879212626130284. Re-locked 2026-09-02:
+        // old annuitized spend rule restored (p3 quota pre-pension, p3-scaled sustainable annuity
+        // with forecast brake in retirement) + shortfall-proportional legacy penalty
+        // (2.5 x shortfall/legacy) - user-requested policy change ("come un tempo").
+        assertEquals(0.17065753269457007, pythonReference, 1e-9)
         assertTrue(pythonReference.isFinite())
+    }
+
+    @Test
+    fun richSurplusData_produces_nonFlat_p1Landscape() {
+        val surplus = SurplusInput(
+            stipendioMensile = 3000.0, premioRisultatoNettoAnnuale = 0.0, tredicesimaQuattordicesimaNetto = 0.0,
+            pensioneMensileNetta = 0.0, mutuoAffitto = 0.0,
+            condominioLavorativa = 0.0, bolletteLavorativa = 0.0, ciboLavorativa = 0.0, veicoliLavorativa = 0.0,
+            palestraLavorativa = 0.0, trasportiViaggiLavorativa = 0.0, saluteLavorativa = 0.0,
+            vacanzeLavorativa = 0.0, shoppingLavorativa = 0.0, altroLavorativa = 0.0,
+            condominioPensione = 0.0, bollettePensione = 0.0, ciboPensione = 0.0, veicoliPensione = 0.0,
+            palestraPensione = 0.0, trasportiViaggiPensione = 0.0, salutePensione = 0.0,
+            vacanzePensione = 0.0, shoppingPensione = 0.0, altroPensione = 0.0
+        )
+        val inputs = FinancialInput(
+            p1SavingRatioSurplus = 0.0,
+            p2EtaFineRisparmioNoCapitale = 65,
+            p3PercentualeCapitaleDaSpendereAnnualmente = 1.0,
+            p4EtaAnticipataInizioSpesaCapitale = 45,
+            etaAttuale = 45,
+            etaPensione = 65,
+            etaMorte = 85,
+            soldiDaConservare = 10_000.0,
+            capitaleIniziale = 300_000.0,
+            valoreSpesaGiornalieraMaxUtilita = 100.0,
+            sogliaMinimaFunzioneUtilita = 0.1
+        ).withDefaultAssumptionCurves()
+
+        val fobjs = mutableListOf<Double>()
+        var p1 = 0.0
+        while (p1 <= 1.001) {
+            val cell = inputs.copy(p1SavingRatioSurplus = p1)
+            val years = calculateSimulation(cell, emptyList(), surplus)
+            val o = calculateObjectivesFromYears(years, bonusStdWeight = 0.0, legacyTarget = cell.soldiDaConservare)
+            fobjs.add(o.fObj0)
+            println("RICH P1=${"%.2f".format(p1)} fobj0=${"%.4f".format(o.fObj0)} avg=${"%.4f".format(o.avgUtilita)} " +
+                "finalNW=${"%.0f".format(o.finalCapital)}")
+            p1 += 0.1
+        }
+        val spread = (fobjs.max() - fobjs.min())
+        println("RICH-LANDSCAPE spread=$spread")
+        assertTrue(
+            "Engine must produce a rich P1 landscape when surplus >> minimum spend (spread=$spread)",
+            spread > 0.10
+        )
     }
 }

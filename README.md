@@ -89,3 +89,13 @@ FinancialAwareness/
 - All user data stays on-device (SharedPreferences); nothing is uploaded
 - Keep `local.properties`, `local.properties`-derived secrets and signing material out of the repository
 - No secrets are committed: the OpenRouter key is entered in-app and stored locally
+
+## License
+
+FinancialAwareness — Copyright (c) 2026 jagones84
+
+Licensed under the **GNU Affero General Public License v3.0 or later** (AGPL-3.0-or-later).
+
+Anyone who redistributes this program — modified or not, in source or compiled form,
+including publishing a derivative app on Google Play or any other store — must release
+the complete corresponding source code under the same license. See [LICENSE](LICENSE).

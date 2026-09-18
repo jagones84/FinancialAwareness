@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 jagones84
+
 package com.example.daysurpopt.ui.screens
 
 import android.annotation.SuppressLint
@@ -27,7 +30,8 @@ import com.google.gson.reflect.TypeToken
 data class SurfaceGrid(
     val x: List<Double>,
     val y: List<Double>,
-    val z: List<List<Double?>>
+    val z: List<List<Double?>>,
+    val anchorColorScaleOnFeasible: Boolean = false
 )
 
 @SuppressLint("SetJavaScriptEnabled")

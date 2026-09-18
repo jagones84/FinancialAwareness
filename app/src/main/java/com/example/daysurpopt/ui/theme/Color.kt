@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 jagones84
+
 package com.example.daysurpopt.ui.theme
 
 import androidx.compose.ui.graphics.Color

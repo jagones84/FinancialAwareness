@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 jagones84
+
 package com.example.daysurpopt.logic
 
 import com.example.daysurpopt.domain.FinancialInput
@@ -101,9 +104,9 @@ object ChartLogic {
             }
         }
         
-        val normalGrid = SurfaceGrid(x = x, y = y, z = z)
+        val normalGrid = SurfaceGrid(x = x, y = y, z = z, anchorColorScaleOnFeasible = true)
         val deltaGrid = if (isComparing) SurfaceGrid(x = x, y = y, z = zDelta) else null
-        
+
         return Pair(normalGrid, deltaGrid)
     }
 
@@ -193,9 +196,9 @@ object ChartLogic {
                 }
             }
         }
-        val normalGrid = SurfaceGrid(x = x, y = y, z = z)
+        val normalGrid = SurfaceGrid(x = x, y = y, z = z, anchorColorScaleOnFeasible = true)
         val deltaGrid = if (isComparing) SurfaceGrid(x = x, y = y, z = zDelta) else null
-        
+
         return Pair(normalGrid, deltaGrid)
     }
 

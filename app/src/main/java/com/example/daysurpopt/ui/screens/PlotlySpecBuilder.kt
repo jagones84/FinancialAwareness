@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 jagones84
+
 package com.example.daysurpopt.ui.screens
 
 import android.util.Log
@@ -300,6 +303,24 @@ object PlotlySpecBuilder {
             return minVal to maxVal
         }
 
+        // Anchors the color range on the feasible cells (z >= 0) so constraint-violating
+        // cells (negative fObjW from the legacy penalty) clamp to the bottom color
+        // instead of destroying the color resolution of the feasible band.
+        fun getFeasibleAnchoredRange(z: List<List<Double?>>): Pair<Double, Double> {
+            var minVal = Double.POSITIVE_INFINITY
+            var maxVal = Double.NEGATIVE_INFINITY
+            for (row in z) {
+                for (v in row) {
+                    if (v == null || v.isNaN() || v.isInfinite() || v < 0.0) continue
+                    if (v < minVal) minVal = v
+                    if (v > maxVal) maxVal = v
+                }
+            }
+            if (!minVal.isFinite() || !maxVal.isFinite()) return getZMinMax(z)
+            if (minVal == maxVal) return minVal to (minVal + 1.0)
+            return minVal to maxVal
+        }
+
         fun contourStep(minVal: Double, maxVal: Double, levels: Int): Double {
             val range = maxVal - minVal
             if (!range.isFinite() || range <= 0.0) return 1.0
@@ -307,7 +328,7 @@ object PlotlySpecBuilder {
         }
 
         if (useHeatmap) {
-            val (zMin, zMax) = getZMinMax(grid.z)
+            val (zMin, zMax) = if (grid.anchorColorScaleOnFeasible) getFeasibleAnchoredRange(grid.z) else getZMinMax(grid.z)
             val levels = 60
             
             if (showContours) {
@@ -336,7 +357,7 @@ object PlotlySpecBuilder {
                 ))
             } else {
                 // Pure Heatmap (no lines, no labels)
-                traces.add(mapOf(
+                val heatmapTrace = mutableMapOf<String, Any>(
                     "type" to "heatmap",
                     "name" to localized.objective,
                     "x" to grid.x,
@@ -345,7 +366,12 @@ object PlotlySpecBuilder {
                     "colorscale" to "Viridis",
                     "showscale" to true,
                     "colorbar" to mapOf("len" to 0.5, "y" to 0.75, "tickfont" to mapOf("color" to "#FFFFFF"))
-                ))
+                )
+                if (grid.anchorColorScaleOnFeasible) {
+                    heatmapTrace["zmin"] = zMin
+                    heatmapTrace["zmax"] = zMax
+                }
+                traces.add(heatmapTrace)
             }
             // Add automatic Min/Max markers
             if (!disableMinMax) {
